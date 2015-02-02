@@ -1,0 +1,397 @@
+#!/usr/bin/env bash
+
+# Ugly wrapper for Git to wrap builtin commands in a shitty manner.
+#
+# Copyright (c) 2015 Recai Oktaş. All rights reserved.
+# Use of this source code is governed by an ISC
+# license that can be found in the LICENSE file.
+#
+# This script exists mainly because I want to clone all repositories
+# under a configured source tree, just like "go get" via GOPATH.
+#
+# TODO more documentation.
+
+NAME=shit
+
+PROGFILE=$0
+PROGNAME=${0##*/}
+NOOP=
+ORIGPWD="$PWD"
+ORIGARGV=("$@")
+
+case $OSTYPE in
+darwin*)
+	alias readlink=greadlink
+	;;
+esac
+
+GIT=git
+if command -v hub >/dev/null; then
+	GIT=hub
+fi
+
+say() {
+	echo -e >&2 "\033[36;01m${*}\033[0m"
+}
+
+cry() {
+	echo -e >&2 "\033[33;01m${PROGNAME}: ${*}\033[0m"
+}
+
+die() {
+	echo -e >&2 "\033[31;01m${PROGNAME}: ${*}\033[0m"
+	exit 1
+}
+
+pass() {
+	if [[ $# -eq 0 ]]; then
+		[[ -n $NOOP ]] || exec "$GIT" "${ORIGARGV[@]}"
+		echo "$GIT" "${ORIGARGV[@]}"; exit 0
+	else
+		[[ -n $NOOP ]] || exec "$GIT" "$@"
+		echo "$GIT" "$@"; exit 0
+	fi
+}
+
+fork() {
+	if [[ $# -eq 0 ]]; then
+		if [[ -z $NOOP ]]; then
+			"$GIT" "${ORIGARGV[@]}"
+		else
+			echo "$GIT" "${ORIGARGV[@]}"
+		fi
+	else
+		if [[ -z $NOOP ]]; then
+			"$GIT" "$@"
+		else
+			echo "$GIT" "$@"
+		fi
+	fi
+}
+
+unrecognized() {
+	cry "Unrecognized option '$1' given; please report the issue."
+	pass
+}
+
+wrapper() {
+	local q="'"
+
+	echo '
+		git() {
+			local GIT_PWD_FILE=$(mktemp -u -t git.XXXXXXXX)
+			trap '$q'
+				err=$?
+				[[ -f $GIT_PWD_FILE ]] && rm -f -- "$GIT_PWD_FILE"
+				return $err
+			'$q' EXIT HUP INT QUIT TERM
+			if GIT_PWD_FILE=$GIT_PWD_FILE "'$PROGNAME'" "$@" && [[ -r $GIT_PWD_FILE ]]; then
+				local dir=$(cat "$GIT_PWD_FILE")
+				[[ -d $dir ]] && cd "$dir"
+			fi
+		}
+	'
+}
+
+command.clone() {
+	clone.parseurl() {
+		local url=$1
+
+		local target=$url
+
+		target=${target%%/}
+		target=${target%.git}
+
+		case $target in
+		https://*|http://*|git://*|ssh://*|ftp://*|ftps://*|rsync://*)
+			target=${target#*://}
+			;;
+		/*|./*|../*|file://*)
+			# skip local repositories
+			return
+			;;
+		esac
+
+		case $target in
+		*@github.*|*.github.*|*@bitbucket.*|*.bitbucket.*|*@gitlab.*|*.gitlab.*)
+			target=${target#*@}
+			target=${target/://}
+			;;
+		*)
+			if [[ -d $url ]]; then
+				return
+			fi
+			case $target in
+			*:*|*~*)
+				cry "Given up parsing fancy url: '$url'."
+				return
+				;;
+			*)
+				target=${target#*@}
+				;;
+			esac
+			;;
+		esac
+
+		echo "$target"
+	}
+
+	clone.main() {
+		local repository target
+
+		if [[ -z $SRCDIR ]]; then
+			cry "SRCDIR not specified"
+			pass
+		fi
+
+		while [[ $# -gt 0 ]]; do
+			case $1 in
+			-*)
+				case $1 in
+				--)
+					break
+					;;
+				--bare|\
+				-l|\
+				--local|\
+				--mirror|\
+				-n|\
+				--no-checkout|\
+				--no-hardlinks|\
+				--no-single-branch|\
+				--progress|\
+				-q|\
+				--quiet|\
+				--recurse-submodules|\
+				--recursive|\
+				-s|\
+				--separate-git-dir|\
+				--shared|\
+				--single-branch|\
+				--template|\
+				-v|\
+				--verbose)
+					# nothing
+					;;
+				-b|\
+				--branch|\
+				-c|\
+				--config|\
+				--depth|\
+				-o|\
+				--origin|\
+				--reference|\
+				-u|\
+				--upload-pack)
+					shift
+					;;
+				*)
+					{ [[ $1 = '-p' ]] && [[ $GIT = hub ]]; } || unrecognized "$1"
+					;;
+				esac
+				;;
+			*)
+				break
+				;;
+			esac
+			shift
+		done
+
+		[[ $# -gt 0 ]] || pass
+
+		repository=$1; target=$2
+
+		[[ -z $target ]] || pass
+
+		if [[ $GIT = hub ]]; then
+			local argv=($(hub --noop clone "$repository"))
+			repository=${argv[2]}
+		fi
+
+		target=$(clone.parseurl "$repository")
+		[[ -n $target ]] || pass
+		target="$SRCDIR/$target"
+
+		if [[ -z $NOOP ]]; then
+			mkdir -p "$target" || cry "Cannot create $target directory"
+		fi
+
+		fork "${ORIGARGV[@]}" "$target"
+		local err=$?
+
+		if [[ $err -eq 0 ]]; then
+			cd "$target" 2>/dev/null && say "→ → →  $target"
+		fi
+
+		return $err
+	}
+}
+
+main.arguments() {
+	[[ $# -gt 0 ]] || pass
+
+	case $1 in
+	wrapper)
+		wrapper
+		exit 0
+		;;
+	wrap)
+		case $SHELL in
+		*/zsh|*/bash|*/ksh)
+			echo "Wrap git (or hub) automatically by adding the following to ~/.${SHELL##*/}rc:"
+			echo
+			echo "    command -v '$PROGNAME' >/dev/null && eval \"\$('$PROGNAME' wrapper)\""
+			if ! command -v $PROGNAME >/dev/null; then
+				echo
+				echo "Ensure that '$PROGNAME' is in your path."
+			fi
+			;;
+		*)
+			echo 'Unsupported shell.'
+		esac
+		exit 0
+		;;
+	--noop)
+		NOOP=yes
+		if [[ $GIT != hub ]]; then
+			shift
+			ORIGARGV=("$@")
+		fi
+		;;
+	--noş|--noşit|--no-şit|--nosh|--noshit|--no-shit)
+		shift
+		exec "$GIT" "$@"
+		;;
+	esac
+
+	while [[ $# -gt 0 ]]; do
+		case $1 in
+		-*)
+			case $1 in
+			--)
+				break
+				;;
+			--help|\
+			--version|\
+			--exec-path)
+				pass
+				;;
+			--bare|\
+			--exec-path=*|\
+			--git-dir=*|\
+			--glob-path-specs|\
+			--html-path|\
+			--icase-path-specs|\
+			--info-path|\
+			--literal-path-specs|\
+			--man-path|\
+			--namespace=*|\
+			--noglob-path-specs|\
+			--no-pager|\
+			--no-replace-objects|\
+			-p|\
+			--paginate|\
+			--work-tree=*)
+				# nothing
+				;;
+			-C|\
+			-c)
+				shift
+				;;
+			*)
+				unrecognized "$1"
+				;;
+			esac
+			;;
+		*)
+			break
+			;;
+		esac
+		shift
+	done
+
+	COMMAND=$1
+	shift
+
+	[[ -n $COMMAND ]] || pass
+
+	ARGV=("$@")
+}
+
+main.initialize() {
+	local srcdir
+
+	srcdir=$(git config --path --get "$NAME.srcdir" 2>/dev/null ||:)
+	if [[ -z $srcdir ]]; then
+		if [[ -n $SRCDIR ]]; then
+			srcdir=$SRCDIR
+		elif [[ -n $GOPATH ]]; then
+			local path
+			IFS=: read -ra path <<< "$GOPATH"
+			for srcdir in "${path[@]}"; do
+				if [[ -n $srcdir ]]; then
+					break
+				fi
+			done
+		fi
+	fi
+	SRCDIR=$srcdir
+
+	readonly \
+		ARGV\
+		COMMAND\
+		NOOP\
+		GIT\
+		NAME\
+		ORIGARGV\
+		ORIGPWD\
+		PROGFILE\
+		PROGNAME\
+		SRCDIR\
+		#
+	readonly -f \
+		cry\
+		die\
+		fork\
+		wrapper\
+		pass\
+		say\
+		#
+	readonly -f \
+		main\
+		main.arguments\
+		main.dispatch\
+		main.finalize\
+		main.initialize\
+		#
+}
+
+main.dispatch() {
+	local include
+
+	include=$(get config --path --get "$NAME.include" 2>/dev/null ||:)
+	if [[ -f $include ]]; then
+		source "$include"
+	fi
+
+	[[ -n $(declare -f command.$COMMAND) ]] || pass
+	command.$COMMAND
+
+	[[ -n $(declare -f $COMMAND.main) ]] || pass
+	$COMMAND.main "${ARGV[@]}"
+}
+
+main.finalize() {
+	if [[ -n ${GIT_PWD_FILE:-} ]] && [[ $ORIGPWD != $PWD ]] && [[ ! -L $GIT_PWD_FILE ]]; then
+		echo "$PWD" >"$GIT_PWD_FILE"
+	fi
+}
+
+main() {
+	main.arguments "$@"
+	main.initialize
+	main.dispatch
+	main.finalize
+}
+
+main "$@"
